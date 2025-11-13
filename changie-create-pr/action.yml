@@ -1,0 +1,40 @@
+name: 'Changie Create PR'
+description: 'Create a pull request with the latest changelog'
+author: 'Daniel Blignaut'
+
+inputs:
+  github-token:
+    description: 'GitHub token for creating releases'
+    required: true
+  bot-token:
+    description: 'Personal Access Token (PAT) for bot user with bypass permissions to push to protected branches'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Batch changes
+      uses: miniscruff/changie-action@v2
+      with:
+        version: latest
+        args: batch auto
+
+    - name: Merge changes
+      shell: bash
+      run: |
+        changie merge
+
+    - name: Get the latest version
+      id: latest
+      uses: miniscruff/changie-action@v2
+      with:
+        version: latest
+        args: latest
+
+    - name: Create Pull Request
+      uses: peter-evans/create-pull-request@v4
+      with:
+        title: Release ${{ steps.latest.outputs.output }}
+        branch: release/${{ steps.latest.outputs.output }}
+        commit-message: Release ${{ steps.latest.outputs.output }}
+        token: ${{ inputs.bot-token }}

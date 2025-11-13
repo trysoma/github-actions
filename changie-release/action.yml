@@ -1,0 +1,227 @@
+name: 'Changie Release'
+description: 'Create a git tag and GitHub release from an existing version (works with changie-create-pr)'
+author: 'Daniel Blignaut'
+
+inputs:
+  github-token:
+    description: 'GitHub token for creating releases'
+    required: true
+  bot-token:
+    description: 'Personal Access Token (PAT) for bot user with bypass permissions to push to protected branches'
+    required: true
+  release-notes-header:
+    description: 'Custom header for release notes'
+    required: false
+    default: ''
+  version-file:
+    description: 'Path to file containing version (e.g., VERSION, .version). If not provided, will extract from CHANGELOG.md'
+    required: false
+    default: ''
+
+outputs:
+  version:
+    description: 'The version that was released'
+    value: ${{ steps.version.outputs.version }}
+  release-url:
+    description: 'URL to the created release'
+    value: ${{ steps.release.outputs.url }}
+  skipped:
+    description: 'Whether the release was skipped'
+    value: ${{ steps.check.outputs.skipped }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Configure Git with Bot Credentials
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.bot-token }}
+      run: |
+        echo "🔧 Configuring git with bot credentials..."
+
+        # Verify which user the PAT belongs to
+        echo "🔍 Verifying PAT user..."
+        AUTHENTICATED_USER=$(gh api user --jq '.login' 2>&1 || echo "Unable to fetch user")
+        echo "👤 Authenticated as: $AUTHENTICATED_USER"
+
+        if [ "$AUTHENTICATED_USER" = "Unable to fetch user" ]; then
+          echo "⚠️  WARNING: Could not verify PAT user. Is the token valid?"
+        fi
+
+        # Check repository permissions
+        echo "🔍 Checking repository permissions..."
+        REPO_PERMISSION=$(gh api repos/${{ github.repository }}/collaborators/$AUTHENTICATED_USER/permission --jq '.permission' 2>&1 || echo "unknown")
+        echo "🔐 Permission level: $REPO_PERMISSION"
+
+        if [ "$REPO_PERMISSION" != "admin" ]; then
+          echo "⚠️  WARNING: User '$AUTHENTICATED_USER' does not have admin permissions!"
+          echo "⚠️  Current permission: $REPO_PERMISSION"
+          echo "⚠️  Required: admin (to bypass branch protection rules)"
+          echo ""
+          echo "To fix this:"
+          echo "1. Go to repository Settings → Collaborators and teams"
+          echo "2. Add '$AUTHENTICATED_USER' as an Admin"
+          echo "3. Or verify the PAT is from a user who is already an admin"
+        fi
+
+        # Set git user (will be used for commits and tags)
+        git config --global user.name "soma-github-bot"
+        git config --global user.email "services+soma-github-bot@trysoma.ai"
+
+        # Configure git to use the bot token for authentication
+        git config --global url."https://oauth2:${{ inputs.bot-token }}@github.com/".insteadOf "https://github.com/"
+
+        # Update the remote URL to use the bot token
+        git remote set-url origin "https://oauth2:${{ inputs.bot-token }}@github.com/${{ github.repository }}.git"
+
+        echo ""
+        echo "✅ Git configured successfully"
+        echo "📍 Remote URL: $(git remote get-url origin | sed 's/oauth2:.*@/oauth2:***@/')"
+
+    - name: Read version from files
+      id: version
+      shell: bash
+      run: |
+        VERSION=""
+
+        # Try to read from specified version file
+        if [ -n "${{ inputs.version-file }}" ] && [ -f "${{ inputs.version-file }}" ]; then
+          VERSION=$(cat "${{ inputs.version-file }}" | tr -d '[:space:]')
+          echo "📄 Read version from ${{ inputs.version-file }}: $VERSION"
+        # Try common version file locations
+        elif [ -f "VERSION" ]; then
+          VERSION=$(cat VERSION | tr -d '[:space:]')
+          echo "📄 Read version from VERSION file: $VERSION"
+        elif [ -f ".version" ]; then
+          VERSION=$(cat .version | tr -d '[:space:]')
+          echo "📄 Read version from .version file: $VERSION"
+        # Try to extract from CHANGELOG.md
+        elif [ -f "CHANGELOG.md" ]; then
+          # Get the first version header from CHANGELOG.md
+          VERSION=$(grep -m 1 -oP '^## \[\K[0-9]+\.[0-9]+\.[0-9]+' CHANGELOG.md || grep -m 1 -oP '^## \K[0-9]+\.[0-9]+\.[0-9]+' CHANGELOG.md || echo "")
+          if [ -n "$VERSION" ]; then
+            echo "📄 Extracted version from CHANGELOG.md: $VERSION"
+          fi
+        fi
+
+        # If no version found, fail
+        if [ -z "$VERSION" ]; then
+          echo "❌ ERROR: Could not find version in any of:"
+          echo "  - ${{ inputs.version-file }}"
+          echo "  - VERSION file"
+          echo "  - .version file"
+          echo "  - CHANGELOG.md"
+          echo ""
+          echo "Make sure changie-create-pr has been merged with version changes."
+          exit 1
+        fi
+
+        # Ensure version has 'v' prefix for tag
+        if [[ ! "$VERSION" =~ ^v ]]; then
+          TAG_VERSION="v${VERSION}"
+        else
+          TAG_VERSION="$VERSION"
+        fi
+
+        # Strip 'v' prefix for display
+        DISPLAY_VERSION=${VERSION#v}
+
+        echo "version=$TAG_VERSION" >> $GITHUB_OUTPUT
+        echo "version_no_prefix=$DISPLAY_VERSION" >> $GITHUB_OUTPUT
+        echo "✅ Version to release: $TAG_VERSION"
+
+    - name: Check if tag already exists
+      id: check
+      shell: bash
+      run: |
+        if git rev-parse "${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+          echo "⚠️  Tag ${{ steps.version.outputs.version }} already exists, skipping release"
+          echo "skipped=true" >> $GITHUB_OUTPUT
+        else
+          echo "✅ Tag ${{ steps.version.outputs.version }} does not exist, proceeding with release"
+          echo "skipped=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Create and push tag
+      if: steps.check.outputs.skipped == 'false'
+      shell: bash
+      run: |
+        git tag -a ${{ steps.version.outputs.version }} -m "Release ${{ steps.version.outputs.version }}"
+        git push origin ${{ steps.version.outputs.version }}
+        echo "✅ Created and pushed tag ${{ steps.version.outputs.version }}"
+
+    - name: Generate release notes
+      if: steps.check.outputs.skipped == 'false'
+      id: release_notes
+      shell: bash
+      run: |
+        # Start with version header or custom header
+        if [ -n "${{ inputs.release-notes-header }}" ]; then
+          echo "${{ inputs.release-notes-header }}" > release_notes.md
+        else
+          echo "## Release ${{ steps.version.outputs.version }}" > release_notes.md
+        fi
+        echo "" >> release_notes.md
+
+        # Extract changelog content from CHANGELOG.md (if exists)
+        CHANGELOG_CONTENT=""
+        if [ -f CHANGELOG.md ]; then
+          # Extract the section for this version (between this version header and the next)
+          CHANGELOG_CONTENT=$(awk "/^## \[?${{ steps.version.outputs.version_no_prefix }}\]?/,/^## \[/{if (/^## \[/ && !f) f=1; else if (f && /^## \[/) exit; else if (f) print}" CHANGELOG.md | grep -v "^$" | head -n -1 || true)
+        fi
+
+        # Add changelog content if found
+        if [ -n "$CHANGELOG_CONTENT" ]; then
+          echo "### Changelog" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "$CHANGELOG_CONTENT" >> release_notes.md
+          echo "" >> release_notes.md
+        fi
+
+        # Add commit history
+        echo "### Commits" >> release_notes.md
+        echo "" >> release_notes.md
+
+        # Get the previous tag if it exists
+        PREVIOUS_TAG=$(git describe --tags --abbrev=0 ${{ steps.version.outputs.version }}^ 2>/dev/null || echo "")
+
+        if [ -z "$PREVIOUS_TAG" ]; then
+          # No previous tags, get all commits (up to 20)
+          COMMIT_COUNT=$(git rev-list --count HEAD)
+          if [ "$COMMIT_COUNT" -gt 20 ]; then
+            git log --pretty=format:"- %s (%an)" -20 >> release_notes.md
+          else
+            git log --pretty=format:"- %s (%an)" >> release_notes.md
+          fi
+        else
+          # Get commits since the previous tag
+          COMMITS=$(git log --pretty=format:"- %s (%an)" ${PREVIOUS_TAG}..HEAD)
+          if [ -n "$COMMITS" ]; then
+            echo "$COMMITS" >> release_notes.md
+          else
+            echo "- No new commits since $PREVIOUS_TAG" >> release_notes.md
+          fi
+        fi
+
+        echo "" >> release_notes.md
+        echo "" >> release_notes.md
+        echo "---" >> release_notes.md
+        echo "*Generated by GitHub Actions*" >> release_notes.md
+
+        echo "📝 Release notes generated:"
+        cat release_notes.md
+
+    - name: Create GitHub Release
+      if: steps.check.outputs.skipped == 'false'
+      id: release
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        RELEASE_URL=$(gh release create ${{ steps.version.outputs.version }} \
+          --title "${{ steps.version.outputs.version }}" \
+          --notes-file release_notes.md \
+          --target ${{ github.sha }} 2>&1 | tail -1)
+
+        echo "url=${RELEASE_URL}" >> $GITHUB_OUTPUT
+        echo "✅ Created release: ${RELEASE_URL}"
